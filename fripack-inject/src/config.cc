@@ -58,6 +58,25 @@ struct EmbeddedConfig {
 
 EXPORT EmbeddedConfig g_embedded_config{};
 
+#ifdef __APPLE__
+// Reserved, file-backed buffer that fripack writes the embedded script into.
+//
+// Mach-O payloads are patched in place rather than rewritten, so the buffer has
+// to exist in the file up front: fripack locates it by section name and fills in
+// `data_size` / `data_offset`. Two invariants matter:
+//   * the initialiser is load-bearing. Drop it and the linker folds the buffer
+//     into zerofill, which occupies no space in the file and cannot be patched.
+//   * it must land in the same segment as g_embedded_config (__DATA), because
+//     `data_offset` is a virtual-address delta between the two.
+// ELF and PE do not need it: fripack appends a section to those instead.
+#ifndef FRIPACK_RESERVE
+#define FRIPACK_RESERVE (1024 * 1024)
+#endif
+
+EXPORT __attribute__((used, section("__DATA,__fripack")))
+unsigned char g_fripack_payload[FRIPACK_RESERVE] = {0};
+#endif
+
 const EmbeddedConfigData &configData() {
   static std::optional<EmbeddedConfigData> config_data;
 
