@@ -84,8 +84,11 @@ EXPORT EmbeddedConfig g_embedded_config{};
 EXPORT __attribute__((used, section("__DATA,__fripack")))
 unsigned char g_fripack_payload[FRIPACK_RESERVE] = {0};
 #elif !defined(_WIN32)
-EXPORT __attribute__((used, section(".data.fripack")))
-unsigned char g_fripack_payload[FRIPACK_RESERVE] = {0};
+// extern "C" so the exported name is exactly g_fripack_payload: fripack looks the
+// buffer up in .dynsym by name, and C++ linkage would export the mangled
+// _ZN7fripack6config17g_fripack_payloadE instead.
+extern "C" EXPORT __attribute__((used))
+unsigned char g_fripack_payload[FRIPACK_RESERVE] = {1};
 #endif
 
 const EmbeddedConfigData &configData() {
