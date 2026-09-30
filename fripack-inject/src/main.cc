@@ -1,6 +1,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <memory>
@@ -86,42 +87,74 @@ public:
     g_object_unref(parser);
   }
 
-  std::promise<void> start_js_thread(const std::string &js_content) {
+  /// Starts the GumJS thread and waits for the script to be loaded.
+  ///
+  /// Returns false when initialisation failed; the reason is logged from here
+  /// rather than thrown out of the worker. Two things used to go wrong:
+  ///
+  ///   * the thread was detached and the try/catch lived on the caller's side,
+  ///     which cannot catch anything the thread throws - so a failing script
+  ///     backend escaped an unhandled thread, called std::terminate and killed
+  ///     the host process;
+  ///   * the promise was moved into the lambda and then returned, while the
+  ///     matching future had already been dropped, so nobody ever waited for
+  ///     initialisation and _fi_main returned before the script was live.
+  bool start_js_thread(const std::string &js_content) {
     logger::println("[*] Starting GumJS hook thread");
+
     std::promise<void> init_promise;
-    std::future<void> init_future = init_promise.get_future();
-    std::thread([this, js_content = std::move(js_content),
-                 promise = std::move(init_promise)]() mutable {
-      gum_init_embedded();
+    auto init_future = init_promise.get_future();
 
-      backend_ = gum_script_backend_obtain_qjs();
-      logger::println("[*] Obtained Gum Script Backend");
+    hook_thread_ = std::make_unique<std::thread>(
+        [this, js_content = js_content,
+         promise = std::move(init_promise)]() mutable {
+          try {
+            gum_init_embedded();
 
-      fripack::hooks::init();
+            backend_ = gum_script_backend_obtain_qjs();
+            logger::println("[*] Obtained Gum Script Backend");
 
-      script_ =
-          gum_script_backend_create_sync(backend_, "script", js_content.data(),
-                                         nullptr, cancellable_, &error_);
-      logger::println("[*] Created Gum Script");
+            fripack::hooks::init();
 
-      if (error_) {
-        throw std::runtime_error(
-            fmt::format("Failed to create script: {}", error_->message));
-      }
+            script_ = gum_script_backend_create_sync(
+                backend_, "script", js_content.data(), nullptr, cancellable_,
+                &error_);
+            logger::println("[*] Created Gum Script");
 
-      gum_script_set_message_handler(script_, on_message, nullptr, nullptr);
-      gum_script_load_sync(script_, cancellable_);
-      context_ = g_main_context_get_thread_default();
-      while (g_main_context_pending(context_)) {
-        g_main_context_iteration(context_, FALSE);
-      }
+            if (error_) {
+              throw std::runtime_error(
+                  fmt::format("Failed to create script: {}", error_->message));
+            }
 
-      promise.set_value();
-      loop_ = g_main_loop_new(g_main_context_get_thread_default(), FALSE);
-      g_main_loop_run(loop_);
-    }).detach();
-    // init_future.get();
-    return init_promise;
+            gum_script_set_message_handler(script_, on_message, nullptr,
+                                           nullptr);
+            gum_script_load_sync(script_, cancellable_);
+            context_ = g_main_context_get_thread_default();
+            while (g_main_context_pending(context_)) {
+              g_main_context_iteration(context_, FALSE);
+            }
+
+            loop_ = g_main_loop_new(g_main_context_get_thread_default(), FALSE);
+            initialized_ = true;
+          } catch (...) {
+            promise.set_exception(std::current_exception());
+            return; // do not enter the run loop
+          }
+
+          promise.set_value();
+          g_main_loop_run(loop_);
+        });
+
+    try {
+      init_future.get();
+    } catch (const std::exception &e) {
+      logger::println("Failed to initialise GumJS: {}", e.what());
+      return false;
+    } catch (...) {
+      logger::println("Failed to initialise GumJS: unknown error");
+      return false;
+    }
+    return true;
   }
 
   std::string read_file_content(const std::string& filepath) {
@@ -251,53 +284,78 @@ private:
   }
 };
 
+namespace {
+GumJSHookManager *g_hook_manager = nullptr;
+
+/// Stops and frees the manager.
+///
+/// Registered with atexit as soon as the manager exists, so it runs before the
+/// library's static destructors instead of during them - tearing the engine down
+/// from a destructor that runs too late touches objects that are already gone.
+void shutdown_hook_manager() {
+  if (g_hook_manager) {
+    g_hook_manager->stop();
+    delete g_hook_manager;
+    g_hook_manager = nullptr;
+  }
+}
+} // namespace
+
 void _fi_main() {
   logger::println("[*] Library loaded, starting GumJS hook");
 
-  // logger::println("Embedded config offset: {}, size: {}, JSON: {}",
-  //                 g_embedded_config.data_offset, g_embedded_config.data_size,
-  //                 json_str);
+  // The work runs on a worker thread, and *everything* inside that thread is
+  // wrapped: an exception escaping a thread function calls std::terminate, which
+  // takes the host process down with it. Previously the try/catch sat around the
+  // std::thread constructor on this thread, where it could never see an
+  // exception thrown by the thread body - so loading an unpatched payload, or a
+  // script that failed to compile, aborted the application we were injected
+  // into.
   try {
     std::thread([=]() {
-      GumJSHookManager *gumjs_hook_manager;
-      auto config = fripack::config::configData();
+      try {
+        auto config = fripack::config::configData();
 
-      gumjs_hook_manager = new GumJSHookManager();
-      std::string js_content;
-      
-      if (config.mode == config::EmbeddedConfigData::Mode::EmbedJs) {
-        if (config.js_content) {
-          js_content = *config.js_content;
-          gumjs_hook_manager->start_js_thread(js_content);
-        } else {
-          logger::println("No JS content provided for EmbedJs mode");
-          return;
-        }
-      } else if (config.mode == config::EmbeddedConfigData::Mode::WatchPath) {
-        if (config.watch_path) {
-          js_content = gumjs_hook_manager->read_file_content(*config.watch_path);
-          if (js_content.empty()) {
-            logger::println("Failed to read initial JS content from: {}", *config.watch_path);
+        g_hook_manager = new GumJSHookManager();
+        std::atexit(shutdown_hook_manager);
+
+        std::string js_content;
+
+        if (config.mode == config::EmbeddedConfigData::Mode::EmbedJs) {
+          if (!config.js_content) {
+            logger::println("No JS content provided for EmbedJs mode");
             return;
           }
-          
-          auto init_promise = gumjs_hook_manager->start_js_thread(js_content);
-
-          gumjs_hook_manager->start_file_watcher(*config.watch_path);
+          js_content = *config.js_content;
+          g_hook_manager->start_js_thread(js_content);
+        } else if (config.mode ==
+                   config::EmbeddedConfigData::Mode::WatchPath) {
+          if (!config.watch_path) {
+            logger::println("No watch path provided for WatchPath mode");
+            return;
+          }
+          js_content = g_hook_manager->read_file_content(*config.watch_path);
+          if (js_content.empty()) {
+            logger::println("Failed to read initial JS content from: {}",
+                            *config.watch_path);
+            return;
+          }
+          if (g_hook_manager->start_js_thread(js_content)) {
+            g_hook_manager->start_file_watcher(*config.watch_path);
+          }
         } else {
-          logger::println("No watch path provided for WatchPath mode");
+          logger::println("Unsupported embedded config mode: {}",
+                          static_cast<int32_t>(config.mode));
           return;
         }
-      } else {
-        logger::println("Unsupported embedded config mode: {}",
-                        static_cast<int32_t>(config.mode));
-        return;
+      } catch (const std::exception &e) {
+        logger::println("Failed to initialise the hook: {}", e.what());
+      } catch (...) {
+        logger::println("Failed to initialise the hook: unknown error");
       }
     }).detach();
   } catch (const std::exception &e) {
-    logger::println("Exception while parsing embedded config data: {}",
-                    e.what());
-    return;
+    logger::println("Could not start the hook thread: {}", e.what());
   }
 }
 } // namespace fripack

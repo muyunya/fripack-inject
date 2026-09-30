@@ -2,3 +2,7 @@
 .xmake
 build
 .cache
+# build output
+libfripack-inject.dylib
+*.so
+*.dll
