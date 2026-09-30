@@ -58,22 +58,33 @@ struct EmbeddedConfig {
 
 EXPORT EmbeddedConfig g_embedded_config{};
 
-#ifdef __APPLE__
 // Reserved, file-backed buffer that fripack writes the embedded script into.
 //
-// Mach-O payloads are patched in place rather than rewritten, so the buffer has
-// to exist in the file up front: fripack locates it by section name and fills in
-// `data_size` / `data_offset`. Two invariants matter:
+// Payloads are patched in place rather than rewritten, so the buffer has to exist
+// in the file up front: fripack locates it by section name and fills in
+// `data_size` / `data_offset`. Three invariants matter:
 //   * the initialiser is load-bearing. Drop it and the linker folds the buffer
 //     into zerofill, which occupies no space in the file and cannot be patched.
-//   * it must land in the same segment as g_embedded_config (__DATA), because
+//   * it must be mapped at runtime, so it needs to sit in an allocated section.
+//     On ELF the `.data.` prefix is what does that: the linker gives `.data.*`
+//     sections SHF_ALLOC | SHF_WRITE and places them in the writable PT_LOAD. A
+//     bare custom name would be file-only and invisible to the process.
+//   * it must land in the same segment as g_embedded_config, because
 //     `data_offset` is a virtual-address delta between the two.
-// ELF and PE do not need it: fripack appends a section to those instead.
+//
+// The alternative - rewriting the binary to make room - does not survive contact
+// with a real payload: appending a program header overwrites whatever follows the
+// program header table (on the Linux payload, .dynsym), and growing a segment's
+// file size turns zero-filled globals into file bytes.
 #ifndef FRIPACK_RESERVE
 #define FRIPACK_RESERVE (1024 * 1024)
 #endif
 
+#if defined(__APPLE__)
 EXPORT __attribute__((used, section("__DATA,__fripack")))
+unsigned char g_fripack_payload[FRIPACK_RESERVE] = {0};
+#elif !defined(_WIN32)
+EXPORT __attribute__((used, section(".data.fripack")))
 unsigned char g_fripack_payload[FRIPACK_RESERVE] = {0};
 #endif
 
